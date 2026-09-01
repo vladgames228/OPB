@@ -1,0 +1,282 @@
+"""
+Scraper for olx.uz.
+
+IMPORTANT: I built and reviewed this code without live network access, so I
+could not fetch a real olx.uz page to confirm exact markup. The parser tries
+two strategies, in order:
+
+1. JSON strategy: OLX (Group) frontends are React/Next.js apps that embed
+   the page's data as JSON in a <script> tag (id="__NEXT_DATA__" or similar,
+   sometimes window.__PRERENDERED_STATE__). We search all <script> tags for
+   a JSON blob and pull ad objects out of it. This is the most reliable
+   method if it matches, because it does not depend on CSS class names.
+
+2. HTML/CSS fallback: common OLX Group markup uses attributes like
+   data-cy="l-card" for each listing card, data-testid="ad-price" for price,
+   etc. If the JSON strategy finds nothing, we fall back to these selectors.
+
+If neither strategy finds ads, `parse_search_page` returns an empty list and
+logs the raw HTML length so you can tell it's a parsing problem, not a
+network problem. Run `python olx_parser.py debug <url>` (see bottom of this
+file) to dump the fetched HTML to data/debug.html for inspection, then adjust
+SELECTORS / the JSON key names below to match what you see.
+"""
+
+import asyncio
+import json
+import logging
+import re
+from dataclasses import dataclass, field
+
+import aiohttp
+from bs4 import BeautifulSoup
+
+log = logging.getLogger("olx_parser")
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+}
+
+BASE = "https://www.olx.uz"
+
+
+@dataclass
+class AdSummary:
+    ad_id: str
+    url: str
+    title: str = ""
+    price: str = ""
+
+
+@dataclass
+class AdDetails:
+    ad_id: str
+    url: str
+    title: str = ""
+    price: str = ""
+    description: str = ""
+    location: str = ""
+    contact_name: str = ""
+    phone: str = ""
+    photos: list = field(default_factory=list)
+
+
+async def _get(session: aiohttp.ClientSession, url: str) -> str:
+    async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+        resp.raise_for_status()
+        return await resp.text()
+
+
+def _extract_next_data(html: str) -> dict | None:
+    """Try to pull the Next.js __NEXT_DATA__ JSON blob out of the page."""
+    m = re.search(
+        r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S
+    )
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError:
+            pass
+    # fallback: any script assigning a big JSON object to a window.* var
+    for m in re.finditer(
+        r"window\.__(?:PRERENDERED_STATE__|INITIAL_STATE__)\s*=\s*(\{.*?\});?\s*</script>",
+        html,
+        re.S,
+    ):
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _find_ads_in_json(obj) -> list:
+    """Recursively search a parsed JSON blob for a list of ad-like dicts."""
+    found = []
+
+    def looks_like_ad(d: dict) -> bool:
+        keys = {k.lower() for k in d.keys()}
+        return "id" in keys and ("url" in keys or "title" in keys) and (
+            "price" in keys or "photos" in keys or "images" in keys
+        )
+
+    def walk(node):
+        if isinstance(node, dict):
+            if looks_like_ad(node):
+                found.append(node)
+            else:
+                for v in node.values():
+                    walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(obj)
+    return found
+
+
+def _ad_from_json(d: dict) -> AdSummary | None:
+    try:
+        ad_id = str(d.get("id"))
+        url = d.get("url") or d.get("link") or ""
+        if url and url.startswith("/"):
+            url = BASE + url
+        title = d.get("title") or d.get("name") or ""
+        price = ""
+        p = d.get("price")
+        if isinstance(p, dict):
+            price = str(p.get("value", {}).get("value", "") if isinstance(p.get("value"), dict) else p.get("value", ""))
+            price = price or p.get("displayValue", "") or p.get("label", "")
+        elif isinstance(p, (str, int, float)):
+            price = str(p)
+        if not ad_id or not url:
+            return None
+        return AdSummary(ad_id=ad_id, url=url, title=title, price=price)
+    except Exception:
+        return None
+
+
+def _parse_search_html_fallback(html: str) -> list:
+    soup = BeautifulSoup(html, "lxml")
+    ads = []
+    cards = soup.select('[data-cy="l-card"]') or soup.select("div.offer-wrapper") or soup.select("a[href*='/d/']")
+    for card in cards:
+        link = card if card.name == "a" else card.select_one("a[href]")
+        if not link or not link.get("href"):
+            continue
+        href = link["href"]
+        if href.startswith("/"):
+            href = BASE + href
+        ad_id_match = re.search(r"ID(\w+)\.html", href) or re.search(r"-(\d{6,})\.html", href)
+        ad_id = ad_id_match.group(1) if ad_id_match else href
+        title_el = card.select_one('[data-cy="ad-card-title"], h6, h4')
+        price_el = card.select_one('[data-testid="ad-price"], p[data-testid="ad-price"]')
+        ads.append(
+            AdSummary(
+                ad_id=str(ad_id),
+                url=href,
+                title=title_el.get_text(strip=True) if title_el else "",
+                price=price_el.get_text(strip=True) if price_el else "",
+            )
+        )
+    return ads
+
+
+async def parse_search_page(session: aiohttp.ClientSession, search_url: str) -> list:
+    html = await _get(session, search_url)
+    data = _extract_next_data(html)
+    ads = []
+    if data:
+        for raw in _find_ads_in_json(data):
+            ad = _ad_from_json(raw)
+            if ad:
+                ads.append(ad)
+    if not ads:
+        ads = _parse_search_html_fallback(html)
+    if not ads:
+        log.warning(
+            "No ads parsed from %s (html length %d). Selectors likely need "
+            "updating - see docstring at top of olx_parser.py",
+            search_url,
+            len(html),
+        )
+    # de-duplicate, preserve order
+    seen = set()
+    unique = []
+    for ad in ads:
+        if ad.ad_id in seen:
+            continue
+        seen.add(ad.ad_id)
+        unique.append(ad)
+    return unique
+
+
+def _parse_ad_html_fallback(html: str, url: str, ad_id: str) -> AdDetails:
+    soup = BeautifulSoup(html, "lxml")
+
+    title_el = soup.select_one('[data-cy="ad_title"], h1')
+    price_el = soup.select_one('[data-testid="ad-price-container"], [data-cy="ad-price-container"] h3')
+    desc_el = soup.select_one('[data-cy="ad_description"], div[data-testid="ad-description"]')
+    loc_el = soup.select_one('[data-testid="location-date"], p[data-testid="ad-location"]')
+
+    photos = []
+    for img in soup.select('[data-cy="adPhotos-swiperCarousel"] img, div[data-testid="image-galery-container"] img, figure img'):
+        src = img.get("src") or img.get("data-src")
+        if src and src not in photos:
+            photos.append(src)
+
+    phone = ""
+    phone_match = re.search(r"(\+?998[\s\-]?\d{2}[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2})", html)
+    if phone_match:
+        phone = phone_match.group(1)
+
+    contact_el = soup.select_one('[data-testid="user-profile-user-name"], [data-cy="seller_name"]')
+
+    return AdDetails(
+        ad_id=ad_id,
+        url=url,
+        title=title_el.get_text(strip=True) if title_el else "",
+        price=price_el.get_text(strip=True) if price_el else "",
+        description=desc_el.get_text("\n", strip=True) if desc_el else "",
+        location=loc_el.get_text(strip=True) if loc_el else "",
+        contact_name=contact_el.get_text(strip=True) if contact_el else "",
+        phone=phone,
+        photos=photos[:10],
+    )
+
+
+async def parse_ad_details(session: aiohttp.ClientSession, ad: AdSummary) -> AdDetails:
+    html = await _get(session, ad.url)
+    data = _extract_next_data(html)
+    if data:
+        candidates = _find_ads_in_json(data)
+        raw = next((c for c in candidates if str(c.get("id")) == ad.ad_id), None)
+        if raw:
+            photos = []
+            for key in ("photos", "images"):
+                for p in raw.get(key, []) or []:
+                    if isinstance(p, str):
+                        photos.append(p)
+                    elif isinstance(p, dict):
+                        u = p.get("url") or p.get("link") or p.get("src")
+                        if u:
+                            photos.append(u)
+            phone = raw.get("phone", "") or raw.get("contact", {}).get("phone", "") if isinstance(raw.get("contact"), dict) else raw.get("phone", "")
+            details = AdDetails(
+                ad_id=ad.ad_id,
+                url=ad.url,
+                title=raw.get("title", ad.title),
+                price=ad.price,
+                description=raw.get("description", "") or raw.get("body", ""),
+                location=raw.get("location", {}).get("city", {}).get("name", "") if isinstance(raw.get("location"), dict) else "",
+                contact_name=raw.get("contact", {}).get("name", "") if isinstance(raw.get("contact"), dict) else "",
+                phone=phone or "",
+                photos=photos[:10],
+            )
+            if details.title or details.description or details.photos:
+                return details
+    # fallback to html scraping (also used to fill gaps like phone number,
+    # since OLX often loads the phone only after a "show phone" click / API
+    # call that a plain HTML fetch will not trigger)
+    return _parse_ad_html_fallback(html, ad.url, ad.ad_id)
+
+
+async def debug_dump(url: str, out_path: str = "data/debug.html"):
+    async with aiohttp.ClientSession() as session:
+        html = await _get(session, url)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"saved {len(html)} bytes to {out_path}")
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) == 3 and sys.argv[1] == "debug":
+        asyncio.run(debug_dump(sys.argv[2]))
+    else:
+        print("usage: python olx_parser.py debug <url>")
