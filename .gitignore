@@ -1,3 +1,6 @@
 .env
 kwords.txt
 confgen.py
+data/
+*.sqlite3
+*.html
