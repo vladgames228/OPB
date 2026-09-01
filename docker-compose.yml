@@ -1,7 +1,7 @@
 services:
-  olx-bot:
+  opb:
     build: .
-    container_name: olx-bot
+    container_name: opb
     restart: unless-stopped
     env_file: .env
     volumes:

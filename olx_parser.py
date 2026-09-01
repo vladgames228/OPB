@@ -50,6 +50,7 @@ class AdSummary:
     url: str
     title: str = ""
     price: str = ""
+    posted: str = ""  # e.g. "Ташкент, Мирзо-Улугбекский район - Сегодня в 18:06"
 
 
 @dataclass
@@ -140,7 +141,30 @@ def _ad_from_json(d: dict) -> AdSummary | None:
         return None
 
 
+def _extract_total_count(html: str) -> int | None:
+    """Read the 'Мы нашли N объявлений' counter. Returns None if not found."""
+    m = re.search(r'data-testid="total-count"[^>]*>([^<]*)<', html)
+    if not m:
+        return None
+    digits = re.sub(r"\D", "", m.group(1))
+    return int(digits) if digits else 0
+
+
+def _cut_before_recommendations(html: str) -> str:
+    """
+    OLX shows a banner (data-testid="qa-header-message") when it falls back
+    to "no results, but here are some related/recommended ads" - any l-card
+    after that banner belongs to that fallback section, not the real search
+    results, and must not be treated as new matching ads. Cut the HTML there.
+    """
+    marker = html.find('data-testid="qa-header-message"')
+    if marker != -1:
+        return html[:marker]
+    return html
+
+
 def _parse_search_html_fallback(html: str) -> list:
+    html = _cut_before_recommendations(html)
     soup = BeautifulSoup(html, "lxml")
     ads = []
     cards = soup.select('[data-cy="l-card"]') or soup.select("div.offer-wrapper") or soup.select("a[href*='/d/']")
@@ -151,16 +175,23 @@ def _parse_search_html_fallback(html: str) -> list:
         href = link["href"]
         if href.startswith("/"):
             href = BASE + href
-        ad_id_match = re.search(r"ID(\w+)\.html", href) or re.search(r"-(\d{6,})\.html", href)
-        ad_id = ad_id_match.group(1) if ad_id_match else href
+        # the card element itself carries the numeric ad id as its id
+        # attribute (id="65926385") - prefer that, it's more reliable than
+        # parsing the slug out of the URL
+        ad_id = card.get("id") or ""
+        if not ad_id:
+            ad_id_match = re.search(r"ID(\w+)\.html", href) or re.search(r"-(\d{6,})\.html", href)
+            ad_id = ad_id_match.group(1) if ad_id_match else href
         title_el = card.select_one('[data-cy="ad-card-title"], h6, h4')
         price_el = card.select_one('[data-testid="ad-price"], p[data-testid="ad-price"]')
+        posted_el = card.select_one('[data-testid="location-date"]')
         ads.append(
             AdSummary(
                 ad_id=str(ad_id),
                 url=href,
                 title=title_el.get_text(strip=True) if title_el else "",
                 price=price_el.get_text(strip=True) if price_el else "",
+                posted=posted_el.get_text(strip=True) if posted_el else "",
             )
         )
     return ads
@@ -168,6 +199,15 @@ def _parse_search_html_fallback(html: str) -> list:
 
 async def parse_search_page(session: aiohttp.ClientSession, search_url: str) -> list:
     html = await _get(session, search_url)
+
+    total = _extract_total_count(html)
+    if total == 0:
+        # OLX shows an empty listing-grid plus a "no results, but here are
+        # some related ads" block full of unrelated recommended cards - if
+        # the real counter says 0, there is nothing to report, full stop.
+        log.info("%s: total-count is 0, treating as no results", search_url)
+        return []
+
     data = _extract_next_data(html)
     ads = []
     if data:
