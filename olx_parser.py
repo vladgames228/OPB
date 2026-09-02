@@ -285,10 +285,12 @@ def _parse_ad_html_fallback(html: str, url: str, ad_id: str) -> AdDetails:
     photos = []
     for img in soup.select(
         '[data-testid="swiper-image"], [data-testid="swiper-image-lazy"], '
-        '[data-testid="image-galery-container"] img, [data-cy="adPhotos-swiperSlide"] img, figure img'
+        '[data-testid="image-galery-container"] img, [data-cy="adPhotos-swiperSlide"] img'
     ):
         src = img.get("src") or img.get("data-src")
-        if src and src not in photos:
+        # guard against relative/non-http src (icons, sprites, lazy
+        # placeholders) - a bad URL here breaks sendMediaGroup entirely
+        if src and src.startswith("http") and src not in photos:
             photos.append(src)
 
     phone = ""
@@ -322,11 +324,13 @@ async def parse_ad_details(session: aiohttp.ClientSession, ad: AdSummary) -> AdD
             for key in ("photos", "images"):
                 for p in raw.get(key, []) or []:
                     if isinstance(p, str):
-                        photos.append(p)
+                        u = p
                     elif isinstance(p, dict):
                         u = p.get("url") or p.get("link") or p.get("src")
-                        if u:
-                            photos.append(u)
+                    else:
+                        u = None
+                    if u and u.startswith("http") and u not in photos:
+                        photos.append(u)
             phone = raw.get("phone", "") or raw.get("contact", {}).get("phone", "") if isinstance(raw.get("contact"), dict) else raw.get("phone", "")
             candidate = AdDetails(
                 ad_id=ad.ad_id,

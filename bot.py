@@ -448,7 +448,9 @@ async def send_ad(chat_id: int, details, fp: str):
     comment = storage.get_comment(chat_id, fp)
     caption = build_caption(details, comment)
     keyboard = build_keyboard(fp)
-    photos = details.photos[:10]
+    # last line of defense: a relative/non-http URL here would make
+    # sendPhoto/sendMediaGroup reject the whole request
+    photos = [p for p in details.photos if p.startswith("http")][:10]
 
     if len(caption) > 1024 and photos:
         # Telegram caption limit on photos/media groups is 1024 chars,
