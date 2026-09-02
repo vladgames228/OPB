@@ -448,9 +448,26 @@ async def send_ad(chat_id: int, details, fp: str):
     comment = storage.get_comment(chat_id, fp)
     caption = build_caption(details, comment)
     keyboard = build_keyboard(fp)
+    photos = details.photos[:10]
 
-    if details.photos:
-        media = [InputMediaPhoto(media=u) for u in details.photos[:10]]
+    if len(caption) > 1024 and photos:
+        # Telegram caption limit on photos/media groups is 1024 chars,
+        # much shorter than the 4096 for plain text messages
+        caption = caption[:1024] + "…"
+
+    if len(photos) == 1:
+        # sendPhoto - a single photo can carry the caption and keyboard
+        # directly, no need for a media group (and a 1-item media group is
+        # rejected by Telegram's API anyway - minimum is 2)
+        try:
+            await bot.send_photo(
+                chat_id, photos[0], caption=caption, parse_mode="HTML", reply_markup=keyboard
+            )
+            return
+        except Exception:
+            log.exception("send_photo failed, falling back to text for %s", details.url)
+    elif len(photos) >= 2:
+        media = [InputMediaPhoto(media=u) for u in photos]
         media[0].caption = caption
         media[0].parse_mode = "HTML"
         try:

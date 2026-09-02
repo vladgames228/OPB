@@ -265,16 +265,28 @@ async def parse_search_page(session: aiohttp.ClientSession, search_url: str) -> 
     return unique
 
 
+def _text(el) -> str:
+    if not el:
+        return ""
+    t = el.get_text(" ", strip=True)
+    return re.sub(r"\s+", " ", t).strip()
+
+
 def _parse_ad_html_fallback(html: str, url: str, ad_id: str) -> AdDetails:
     soup = BeautifulSoup(html, "lxml")
 
-    title_el = soup.select_one('[data-cy="ad_title"], h1')
+    # confirmed against a real olx.uz ad page dump
+    title_el = soup.select_one('[data-cy="offer_title"], [data-testid="offer_title"], h1')
     price_el = soup.select_one('[data-testid="ad-price-container"], [data-cy="ad-price-container"] h3')
-    desc_el = soup.select_one('[data-cy="ad_description"], div[data-testid="ad-description"]')
-    loc_el = soup.select_one('[data-testid="location-date"], p[data-testid="ad-location"]')
+    desc_el = soup.select_one('[data-cy="ad_description"], [data-testid="ad_description"]')
+    loc_el = soup.select_one('[data-cy="ad-posted-at"], [data-testid="ad-posted-at"], [data-testid="location-date"]')
+    contact_el = soup.select_one('[data-testid="trader-title"], [data-testid="user-profile-user-name"], [data-cy="seller_name"]')
 
     photos = []
-    for img in soup.select('[data-cy="adPhotos-swiperCarousel"] img, div[data-testid="image-galery-container"] img, figure img'):
+    for img in soup.select(
+        '[data-testid="swiper-image"], [data-testid="swiper-image-lazy"], '
+        '[data-testid="image-galery-container"] img, [data-cy="adPhotos-swiperSlide"] img, figure img'
+    ):
         src = img.get("src") or img.get("data-src")
         if src and src not in photos:
             photos.append(src)
@@ -284,16 +296,14 @@ def _parse_ad_html_fallback(html: str, url: str, ad_id: str) -> AdDetails:
     if phone_match:
         phone = phone_match.group(1)
 
-    contact_el = soup.select_one('[data-testid="user-profile-user-name"], [data-cy="seller_name"]')
-
     return AdDetails(
         ad_id=ad_id,
         url=url,
-        title=title_el.get_text(strip=True) if title_el else "",
-        price=price_el.get_text(strip=True) if price_el else "",
+        title=_text(title_el),
+        price=_text(price_el),
         description=desc_el.get_text("\n", strip=True) if desc_el else "",
-        location=loc_el.get_text(strip=True) if loc_el else "",
-        contact_name=contact_el.get_text(strip=True) if contact_el else "",
+        location=_text(loc_el),
+        contact_name=_text(contact_el),
         phone=phone,
         photos=photos[:10],
     )
