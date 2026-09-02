@@ -106,7 +106,8 @@ async def cmd_help(message: Message):
         "/favorites - показать сохранённое в избранном\n\n"
         "Если объявление подходит под несколько поисков в одной группе - "
         "пришлю его один раз. Под каждым объявлением есть кнопки: "
-        "⭐ избранное, 👎 больше не показывать (и его переподачи тоже), "
+        "⭐ избранное (сохранит и уберёт пост из чата, смотреть потом в "
+        "/favorites), 👎 больше не показывать (и его переподачи тоже), "
         "💬 комментарий (сохранится и появится снова, если объявление "
         "попадётся ещё раз).\n\n"
         f"Опрос идёт каждые {POLL_INTERVAL_SECONDS} сек, запросы к olx.uz "
@@ -355,11 +356,13 @@ async def cmd_favorites(message: Message):
     if not favs:
         await message.answer("Избранное пусто.")
         return
-    lines = []
     for f in favs:
         price = f" — {esc(f['price'])}" if f["price"] else ""
-        lines.append(f'<a href="{esc(f["url"])}">{esc(f["title"]) or f["url"]}</a>{price}')
-    await message.answer("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+        text = f'<a href="{esc(f["url"])}">{esc(f["title"]) or f["url"]}</a>{price}'
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🗑 Удалить из избранного", callback_data=f"unfav:{f['fp']}")
+        ]])
+        await message.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
 
 
 @dp.callback_query(F.data.startswith("fav:"))
@@ -373,7 +376,31 @@ async def cb_fav(query: CallbackQuery):
         await query.answer("Информация об объявлении устарела.", show_alert=True)
         return
     storage.add_favorite(query.from_user.id, fp, cached["ad_id"], cached["title"], cached["price"], cached["url"])
+
+    # drop the whole post (photos + actions panel) from the chat now that
+    # it's saved in /favorites - nothing to keep cluttering the feed for
+    chat_id = query.message.chat.id
+    for mid in storage.get_sent_messages(fp, chat_id):
+        try:
+            await bot.delete_message(chat_id, mid)
+        except Exception:
+            pass  # already gone / too old to delete, ignore
+
     await query.answer("Добавлено в избранное ⭐")
+
+
+@dp.callback_query(F.data.startswith("unfav:"))
+async def cb_unfav(query: CallbackQuery):
+    if not allowed(query.from_user.id):
+        await query.answer()
+        return
+    fp = query.data.split(":", 1)[1]
+    storage.remove_favorite(query.from_user.id, fp)
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    await query.answer("Удалено из избранного")
 
 
 @dp.callback_query(F.data.startswith("dis:"))
@@ -457,35 +484,62 @@ async def send_ad(chat_id: int, details, fp: str):
         # much shorter than the 4096 for plain text messages
         caption = caption[:1024] + "…"
 
+    message_ids = []
+
     if len(photos) == 1:
         # sendPhoto - a single photo can carry the caption and keyboard
         # directly, no need for a media group (and a 1-item media group is
         # rejected by Telegram's API anyway - minimum is 2)
         try:
-            await bot.send_photo(
+            msg = await bot.send_photo(
                 chat_id, photos[0], caption=caption, parse_mode="HTML", reply_markup=keyboard
             )
-            return
+            message_ids = [msg.message_id]
         except Exception:
-            log.exception("send_photo failed, falling back to text for %s", details.url)
+            log.exception("send_photo failed for %s", details.url)
+
     elif len(photos) >= 2:
         media = [InputMediaPhoto(media=u) for u in photos]
         media[0].caption = caption
         media[0].parse_mode = "HTML"
         try:
-            await bot.send_media_group(chat_id, media)
+            msgs = await bot.send_media_group(chat_id, media)
+            message_ids = [m.message_id for m in msgs]
             # Telegram does not allow inline keyboards on media groups, so
             # the action buttons go in a small follow-up message
-            await bot.send_message(chat_id, "Действия к объявлению выше 👆", reply_markup=keyboard)
-            return
+            actions_msg = await bot.send_message(chat_id, "Действия к объявлению выше 👆", reply_markup=keyboard)
+            message_ids.append(actions_msg.message_id)
         except Exception:
-            log.exception("send_media_group failed, falling back to text for %s", details.url)
+            # a single bad/unreachable photo URL (e.g. WEBPAGE_CURL_FAILED)
+            # makes Telegram reject the WHOLE album - fall back to sending
+            # each photo one at a time so the good ones still get through
+            log.exception("send_media_group failed, sending photos individually for %s", details.url)
+            captioned = False
+            for url in photos:
+                try:
+                    if not captioned:
+                        msg = await bot.send_photo(
+                            chat_id, url, caption=caption, parse_mode="HTML", reply_markup=keyboard
+                        )
+                        captioned = True
+                    else:
+                        msg = await bot.send_photo(chat_id, url)
+                    message_ids.append(msg.message_id)
+                except Exception:
+                    log.exception("send_photo failed for one image of %s", details.url)
+                    continue
 
-    if len(caption) > 4000:
-        caption = caption[:4000] + "…"
-    await bot.send_message(
-        chat_id, caption, parse_mode="HTML", reply_markup=keyboard, disable_web_page_preview=False
-    )
+    if not message_ids:
+        # no photos, or every single one failed to send
+        text_caption = caption
+        if len(text_caption) > 4000:
+            text_caption = text_caption[:4000] + "…"
+        msg = await bot.send_message(
+            chat_id, text_caption, parse_mode="HTML", reply_markup=keyboard, disable_web_page_preview=False
+        )
+        message_ids = [msg.message_id]
+
+    storage.set_sent_messages(fp, chat_id, message_ids)
 
 
 # ---------------- polling ----------------

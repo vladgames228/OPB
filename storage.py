@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -87,6 +88,16 @@ class Storage:
                     comment TEXT NOT NULL,
                     updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (user_id, fp)
+                );
+
+                -- message ids of the latest post for a given ad (per chat),
+                -- so the "favorite" button can delete the whole post
+                CREATE TABLE IF NOT EXISTS sent_messages (
+                    fp TEXT NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    message_ids TEXT NOT NULL,
+                    sent_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (fp, chat_id)
                 );
             """)
 
@@ -245,6 +256,13 @@ class Storage:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def remove_favorite(self, user_id: int, fp: str) -> bool:
+        with self._lock_conn() as c:
+            cur = c.execute(
+                "DELETE FROM favorites WHERE user_id = ? AND fp = ?", (user_id, fp)
+            )
+            return cur.rowcount > 0
+
     # ---------- dislikes ----------
 
     def add_dislike(self, user_id: int, fp: str):
@@ -282,3 +300,30 @@ class Storage:
                 (user_id, fp),
             ).fetchone()
             return row["comment"] if row else None
+
+    # ---------- sent messages (so the favorite button can drop the post) ----------
+
+    def set_sent_messages(self, fp: str, chat_id: int, message_ids: list):
+        with self._lock_conn() as c:
+            c.execute(
+                """
+                INSERT INTO sent_messages (fp, chat_id, message_ids, sent_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(fp, chat_id) DO UPDATE SET
+                    message_ids=excluded.message_ids, sent_at=CURRENT_TIMESTAMP
+                """,
+                (fp, chat_id, json.dumps(message_ids)),
+            )
+
+    def get_sent_messages(self, fp: str, chat_id: int) -> list:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT message_ids FROM sent_messages WHERE fp = ? AND chat_id = ?",
+                (fp, chat_id),
+            ).fetchone()
+            if not row:
+                return []
+            try:
+                return json.loads(row["message_ids"])
+            except (ValueError, TypeError):
+                return []
