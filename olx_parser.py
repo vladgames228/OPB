@@ -1,30 +1,35 @@
 """
 Scraper for olx.uz.
 
-IMPORTANT: I built and reviewed this code without live network access, so I
-could not fetch a real olx.uz page to confirm exact markup. The parser tries
-two strategies, in order:
+Confirmed against a real olx.uz search-page HTML dump (see README): this
+site does NOT use Next.js/__NEXT_DATA__ - it's server-rendered HTML with no
+embedded JSON blob of listings. So the actual, verified strategy is:
 
-1. JSON strategy: OLX (Group) frontends are React/Next.js apps that embed
-   the page's data as JSON in a <script> tag (id="__NEXT_DATA__" or similar,
-   sometimes window.__PRERENDERED_STATE__). We search all <script> tags for
-   a JSON blob and pull ad objects out of it. This is the most reliable
-   method if it matches, because it does not depend on CSS class names.
+1. HTML/CSS parsing using data-cy="l-card" (listing card), data-cy=
+   "ad-card-title", data-testid="ad-price", data-testid="location-date".
+   Confirmed against a real page.
+2. A `data-testid="total-count"` counter ("Мы нашли N объявлений") is used
+   to detect the "0 results, showing recommended ads instead" case and
+   short-circuit to an empty list, so recommended/unrelated ads never get
+   reported as new matches.
+3. For ad photos, the most robust signal turned out to be the CDN URL
+   pattern itself (apollo.olxcdn.com/v1/files/<id>/image), which does not
+   depend on any particular wrapping markup - see _extract_apollo_photos.
 
-2. HTML/CSS fallback: common OLX Group markup uses attributes like
-   data-cy="l-card" for each listing card, data-testid="ad-price" for price,
-   etc. If the JSON strategy finds nothing, we fall back to these selectors.
+The __NEXT_DATA__/window.__PRERENDERED_STATE__ JSON strategy is kept as a
+first attempt in case a future page (or an ad detail page) does embed such
+a blob, but on the pages seen so far it finds nothing and falls through to
+the HTML strategy.
 
-If neither strategy finds ads, `parse_search_page` returns an empty list and
-logs the raw HTML length so you can tell it's a parsing problem, not a
-network problem. Run `python olx_parser.py debug <url>` (see bottom of this
-file) to dump the fetched HTML to data/debug.html for inspection, then adjust
-SELECTORS / the JSON key names below to match what you see.
+If parsing still comes up empty, run `python olx_parser.py debug <url>`
+(see bottom of this file) to dump the fetched HTML to data/debug.html for
+inspection.
 """
 
 import asyncio
 import json
 import logging
+import random
 import re
 from dataclasses import dataclass, field
 
@@ -42,6 +47,11 @@ HEADERS = {
 }
 
 BASE = "https://www.olx.uz"
+
+# every request to olx.uz waits a random 3-5s beforehand, so we never hit
+# the site faster than that regardless of how many searches/ads we process
+MIN_DELAY = 3.0
+MAX_DELAY = 5.0
 
 
 @dataclass
@@ -67,9 +77,29 @@ class AdDetails:
 
 
 async def _get(session: aiohttp.ClientSession, url: str) -> str:
+    await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
     async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=30)) as resp:
         resp.raise_for_status()
         return await resp.text()
+
+
+_APOLLO_RE = re.compile(
+    r"(https://[\w.]*apollo\.olxcdn\.com(?::\d+)?/v1/files/[\w-]+)/image"
+)
+
+
+def _extract_apollo_photos(html: str) -> list:
+    """
+    OLX photos are served from apollo.olxcdn.com/v1/files/<id>/image;s=WxH...
+    regardless of the surrounding markup, so this is a robust way to pull
+    real photo URLs even if CSS selectors below don't match. We rebuild the
+    URL with a larger size so Telegram gets a decent-resolution photo.
+    """
+    seen = []
+    for base in _APOLLO_RE.findall(html):
+        if base not in seen:
+            seen.append(base)
+    return [f"{u}/image;s=1080x1080;q=80" for u in seen]
 
 
 def _extract_next_data(html: str) -> dict | None:
@@ -271,6 +301,8 @@ def _parse_ad_html_fallback(html: str, url: str, ad_id: str) -> AdDetails:
 
 async def parse_ad_details(session: aiohttp.ClientSession, ad: AdSummary) -> AdDetails:
     html = await _get(session, ad.url)
+    details = None
+
     data = _extract_next_data(html)
     if data:
         candidates = _find_ads_in_json(data)
@@ -286,7 +318,7 @@ async def parse_ad_details(session: aiohttp.ClientSession, ad: AdSummary) -> AdD
                         if u:
                             photos.append(u)
             phone = raw.get("phone", "") or raw.get("contact", {}).get("phone", "") if isinstance(raw.get("contact"), dict) else raw.get("phone", "")
-            details = AdDetails(
+            candidate = AdDetails(
                 ad_id=ad.ad_id,
                 url=ad.url,
                 title=raw.get("title", ad.title),
@@ -297,12 +329,29 @@ async def parse_ad_details(session: aiohttp.ClientSession, ad: AdSummary) -> AdD
                 phone=phone or "",
                 photos=photos[:10],
             )
-            if details.title or details.description or details.photos:
-                return details
-    # fallback to html scraping (also used to fill gaps like phone number,
-    # since OLX often loads the phone only after a "show phone" click / API
-    # call that a plain HTML fetch will not trigger)
-    return _parse_ad_html_fallback(html, ad.url, ad.ad_id)
+            if candidate.title or candidate.description or candidate.photos:
+                details = candidate
+
+    if details is None:
+        # fallback to html scraping (also used to fill gaps like phone
+        # number, since OLX often loads the phone only after a "show phone"
+        # click / API call that a plain HTML fetch will not trigger)
+        details = _parse_ad_html_fallback(html, ad.url, ad.ad_id)
+
+    if not details.photos:
+        # CDN-URL-pattern extraction is more robust than any CSS selector
+        # guess and works regardless of the surrounding markup
+        details.photos = _extract_apollo_photos(html)[:10]
+
+    return details
+
+
+def short_query_label(url: str) -> str:
+    """Extract the human-readable query token between 'q-' and the next
+    '/' or '?' in an olx.uz search URL, e.g. '.../q-2-komnaty-chilanzar/?...'
+    -> '2-komnaty-chilanzar'. Falls back to the full URL if not found."""
+    m = re.search(r"/q-([^/?]+)", url)
+    return m.group(1) if m else url
 
 
 async def debug_dump(url: str, out_path: str = "data/debug.html"):
